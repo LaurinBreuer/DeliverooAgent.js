@@ -12,8 +12,12 @@ import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
  * - one-way tiles (↑ → ↓ ←): directed BFS, and a reverse BFS for distances to delivery
  * - parcels and agents are remembered when out of sight
  * - opportunistic pickup / putdown while walking
- * - explore prefers spawners not seen for the longest time
- * - perceived crates are obstacles; no blind (map-ignoring) fallback move
+ * - explore prefers spawners not seen for the longest time (any tile if no spawner is reachable)
+ * - crates are pushed: walking into a crate moves it one tile, if it can slide there.
+ *   Paths are planned with pushes as costlier steps; pushes that would block a bottleneck
+ *   (corridor, doorway) cost much more, and a crate is never left stuck on a bottleneck.
+ *   Crates are assumed on their '5!' spawn tiles until seen otherwise.
+ * - no blind (map-ignoring) fallback move
  */
 
 const socket = DjsConnect();
@@ -43,6 +47,12 @@ const SWITCH_MARGIN = 10;
 const AGENT_MEMORY_MS = 2000;
 /** Sensing events to wait when the only path is blocked by other agents */
 const BLOCKED_WAIT_SENSINGS = 10;
+/** Max steps backed out of a bottleneck to let another agent pass */
+const MAKE_WAY_MAX_STEPS = 8;
+/** Extra cost of pushing a crate: free paths are preferred, crates are moved only when it pays off */
+const PUSH_COST = 2;
+/** Extra cost of pushing a crate onto a bottleneck (corridor, doorway), where it blocks the way: a detour is usually better */
+const BOTTLENECK_PUSH_COST = 15;
 
 /**
  * Belief revision
@@ -137,6 +147,10 @@ socket.onMap((width, height, mapTiles) => {
   spawnerTiles = mapTiles.filter((t) => String(t.type) == "1");
   const arrows = mapTiles.filter((t) => FORBIDDEN_ENTRY[String(t.type)]).length;
   console.log("map", width, "x", height, "|", deliveryTiles.length, "delivery,", spawnerTiles.length, "spawners,", arrows, "arrows");
+  // crates are created on '5!' tiles: assume they are still there until seen otherwise
+  crates.clear();
+  for (const t of mapTiles) if (String(t.type) == "5!") crates.add(key(t));
+  recomputeCrateTiles();
   recomputeToDelivery();
   const unreachable = spawnerTiles.filter((t) => !toDelivery.has(key(t))).length;
   console.log(
@@ -151,6 +165,7 @@ socket.onTile((t) => {
   tiles.set(key(t), String(t.type));
   deliveryTiles = Array.from(tiles).filter(([, type]) => ["2", "9"].includes(type)).map(([k]) => fromKey(k));
   spawnerTiles = Array.from(tiles).filter(([, type]) => type == "1").map(([k]) => fromKey(k));
+  recomputeCrateTiles();
   recomputeToDelivery();
 });
 
@@ -160,52 +175,156 @@ const fromKey = (k) => {
   return { x, y };
 };
 
-/** Crates are obstacles: delivery distances change when they move */
+/** Crates change delivery distances when they move */
 let toDeliveryCrates = "";
 function recomputeToDelivery() {
   toDeliveryCrates = Array.from(crates).sort().join(",");
-  toDelivery = bfs(deliveryTiles, crates, true);
+  toDelivery = bfs(deliveryTiles, new Set(), true);
 }
 
 /**
- * Breadth-first search on the directed tile graph.
- * - forward (default): steps from the nearest source to every tile, and the first move from the source
- * - reverse: steps from every tile to the nearest source, and the first move from that tile
+ * Walking into a crate pushes it one tile further, but crates only slide onto
+ * free crate tiles ('5' sliding, '5!' spawner): no other crate, no agent.
+ * @param { {x:number, y:number} } crate
+ * @param { Direction } direction
+ * @param { Set<string> } blocked tiles occupied by agents
+ * @returns { number } extra cost of the push, Infinity if not possible
+ */
+function pushCost(crate, direction, blocked) {
+  const { dx, dy } = /** @type { {dx:number, dy:number} } */ (MOVES.find((m) => m.direction == direction));
+  const k = key({ x: crate.x + dx, y: crate.y + dy });
+  if (!isCrateTile(k) || crates.has(k) || blocked.has(k)) return Infinity;
+  if (!bottlenecks.has(k)) return PUSH_COST;
+  // a crate on a bottleneck cuts the map in two: never leave it there for good
+  return stuckTiles.has(k) ? Infinity : BOTTLENECK_PUSH_COST;
+}
+
+/** @type { function (string): boolean } */
+const isCrateTile = (k) => (tiles.get(k) ?? "").startsWith("5");
+/** @type { function (string): boolean } */
+const isWalkable = (k) => tiles.has(k) && tiles.get(k) != "0";
+
+/**
+ * Crate tiles a crate could never leave again (e.g. the dead end of a corridor):
+ * every push from there, if any, only leads to another stuck tile.
+ * A push needs a crate tile on one side and a walkable tile to push from on the other.
+ * @type { Set<string> }
+ */
+let stuckTiles = new Set();
+/**
+ * Bottleneck tiles (articulation points of the walkable map, e.g. 1-wide corridors and doorways):
+ * blocking one of them with a crate disconnects part of the map.
+ * @type { Set<string> }
+ */
+let bottlenecks = new Set();
+function recomputeCrateTiles() {
+  bottlenecks = articulationPoints();
+  const crateTiles = Array.from(tiles.keys()).filter(isCrateTile);
+  stuckTiles = new Set();
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const k of crateTiles) {
+      if (stuckTiles.has(k)) continue;
+      const { x, y } = fromKey(k);
+      const movable = MOVES.some(({ dx, dy }) => {
+        const to = key({ x: x + dx, y: y + dy });
+        return isCrateTile(to) && !stuckTiles.has(to) && isWalkable(key({ x: x - dx, y: y - dy }));
+      });
+      if (!movable) {
+        stuckTiles.add(k);
+        changed = true;
+      }
+    }
+  }
+}
+
+/**
+ * Articulation points of the undirected graph of walkable tiles (Tarjan's algorithm)
+ * @returns { Set<string> }
+ */
+function articulationPoints() {
+  /** @type { Map<string, number> } */ const depth = new Map();
+  /** @type { Map<string, number> } */ const low = new Map();
+  const points = new Set();
+  /** @type { function (string, string | undefined): void } */
+  const visit = (k, parent) => {
+    depth.set(k, depth.size);
+    low.set(k, /** @type {number} */ (depth.get(k)));
+    const { x, y } = fromKey(k);
+    let children = 0;
+    for (const { dx, dy } of MOVES) {
+      const n = key({ x: x + dx, y: y + dy });
+      if (!isWalkable(n) || n == parent) continue;
+      if (depth.has(n)) {
+        low.set(k, Math.min(/** @type {number} */ (low.get(k)), /** @type {number} */ (depth.get(n))));
+        continue;
+      }
+      children++;
+      visit(n, k);
+      low.set(k, Math.min(/** @type {number} */ (low.get(k)), /** @type {number} */ (low.get(n))));
+      if (parent !== undefined && /** @type {number} */ (low.get(n)) >= /** @type {number} */ (depth.get(k))) points.add(k);
+    }
+    if (parent === undefined && children > 1) points.add(k);
+  };
+  for (const k of tiles.keys()) if (isWalkable(k) && !depth.has(k)) visit(k, undefined);
+  return points;
+}
+
+/**
+ * Cost of stepping into `to` with move `direction`: 1, plus the push cost if a crate is there,
+ * Infinity if not possible.
+ * @param { {x:number, y:number} } to
+ * @param { Direction } direction
+ * @param { Set<string> } blocked tiles occupied by agents
+ * @param { boolean } crateThere
+ */
+function stepCost(to, direction, blocked, crateThere = crates.has(key(to))) {
+  if (blocked.has(key(to)) || !canEnter(to, direction)) return Infinity;
+  return 1 + (crateThere ? pushCost(to, direction, blocked) : 0);
+}
+
+/**
+ * Shortest paths on the directed tile graph (Dijkstra with integer-cost buckets).
+ * Crates are not walls: they can be pushed, at an extra cost. Going forward, a crate pushed
+ * on the way is still ahead: the next step in the same direction pushes it again.
+ * - forward (default): cost from the nearest source to every tile, and the first move from the source
+ * - reverse: cost from every tile to the nearest source, and the first move from that tile
  * @param { {x:number, y:number}[] } sources
- * @param { Set<string> } blocked
+ * @param { Set<string> } blocked tiles occupied by agents
  * @param { boolean } reverse
- * @returns { Map< string, {steps:number, first?:Direction} > }
+ * @returns { Map< string, {steps:number, first?:Direction, pushed?:Direction} > }
  */
 function bfs(sources, blocked = new Set(), reverse = false) {
-  /** @type { Map< string, {steps:number, first?:Direction} > } */
+  /** @type { Map< string, {steps:number, first?:Direction, pushed?:Direction} > } */
   const found = new Map();
-  const queue = [];
+  /** @type { {x:number, y:number}[][] } tiles to expand, by cost */
+  const buckets = [[]];
   for (const s of sources) {
     const k = key(s);
     if (found.has(k)) continue;
     found.set(k, { steps: 0 });
-    queue.push({ x: Math.round(s.x), y: Math.round(s.y) });
+    buckets[0].push({ x: Math.round(s.x), y: Math.round(s.y) });
   }
-  for (let i = 0; i < queue.length; i++) {
-    const tile = queue[i];
-    const here = /** @type { {steps:number, first?:Direction} } */ (found.get(key(tile)));
-    for (const { direction, dx, dy } of MOVES) {
-      if (!reverse) {
-        // tile --direction--> next
-        const next = { x: tile.x + dx, y: tile.y + dy };
+  for (let cost = 0; cost < buckets.length; cost++) {
+    for (const tile of buckets[cost] ?? []) {
+      const here = /** @type { {steps:number, first?:Direction, pushed?:Direction} } */ (found.get(key(tile)));
+      if (here.steps < cost) continue; // already expanded with a lower cost
+      for (const { direction, dx, dy } of MOVES) {
+        // forward: tile --direction--> next.  reverse: next --direction--> tile
+        const next = reverse ? { x: tile.x - dx, y: tile.y - dy } : { x: tile.x + dx, y: tile.y + dy };
         const k = key(next);
-        if (found.has(k) || blocked.has(k) || !canEnter(next, direction)) continue;
-        found.set(k, { steps: here.steps + 1, first: here.first ?? direction });
-        queue.push(next);
-      } else {
-        // prev --direction--> tile
-        const prev = { x: tile.x - dx, y: tile.y - dy };
-        const k = key(prev);
-        const prevType = tiles.get(k);
-        if (found.has(k) || blocked.has(k) || prevType === undefined || prevType == "0") continue;
-        if (!canEnter(tile, direction)) continue;
-        found.set(k, { steps: here.steps + 1, first: direction });
-        queue.push(prev);
+        const nextType = tiles.get(k);
+        if (nextType === undefined || nextType == "0" || blocked.has(k)) continue;
+        const crateThere = !reverse && (crates.has(k) || here.pushed == direction);
+        const step = reverse ? stepCost(tile, direction, blocked) : stepCost(next, direction, blocked, crateThere);
+        const total = cost + step;
+        if (total >= (found.get(k)?.steps ?? Infinity)) continue;
+        found.set(k, {
+          steps: total,
+          first: reverse ? direction : here.first ?? direction,
+          pushed: crateThere ? direction : undefined,
+        });
+        (buckets[total] ??= []).push(next);
       }
     }
   }
@@ -224,11 +343,11 @@ const parcels = new Map();
 /** @type { Map< string, {id:string, x:number, y:number, seenAt:number} > } */
 const agents = new Map();
 
-/** @type { Set<string> } tiles with a perceived crate */
+/** @type { Set<string> } tiles with a crate (last seen position) */
 const crates = new Set();
 
-/** @type { Map<string, number> } last time each spawner tile was in sight */
-const spawnerSeenAt = new Map();
+/** @type { Map<string, number> } last time each tile was in sight */
+const tileSeenAt = new Map();
 
 /** Incremented at every sensing event, used to cache path computations */
 let sensingCount = 0;
@@ -281,13 +400,14 @@ socket.onSensing((sensing) => {
     for (const a of agents.values()) if (key(a) == key(p)) parcels.delete(id);
   }
 
-  // crates
-  crates.clear();
-  for (const c of sensing.crates ?? []) crates.add(key(c));
+  // crates: remembered where last seen, forgotten when their tile is in sight and empty
+  const sensedCrates = new Set((sensing.crates ?? []).map(key));
+  for (const k of crates) if (!sensedCrates.has(k) && inSight(fromKey(k))) crates.delete(k);
+  for (const k of sensedCrates) crates.add(k);
   if (Array.from(crates).sort().join(",") != toDeliveryCrates) recomputeToDelivery();
 
-  // spawners in sight
-  for (const t of spawnerTiles) if (inSight(t)) spawnerSeenAt.set(key(t), now);
+  // tiles in sight
+  for (const k of tiles.keys()) if (inSight(fromKey(k))) tileSeenAt.set(k, now);
 });
 
 /**
@@ -302,9 +422,9 @@ const carried = () => Array.from(parcels.values()).filter((p) => p.carriedBy == 
 /** @returns free parcels */
 const freeParcels = () => Array.from(parcels.values()).filter((p) => !p.carriedBy);
 
-/** @returns { Set<string> } tiles occupied by agents currently in sight (both tiles if moving), and crates */
+/** @returns { Set<string> } tiles occupied by agents currently in sight (both tiles if moving) */
 function obstacles() {
-  const blocked = new Set(crates);
+  const blocked = new Set();
   for (const a of agents.values()) {
     if (a.seenAt != lastSensingAt) continue;
     blocked.add(key({ x: Math.floor(a.x), y: Math.floor(a.y) }));
@@ -313,25 +433,25 @@ function obstacles() {
   return blocked;
 }
 
-/** Paths from my position, avoiding obstacles. Cached until I move or sense again. */
-let pathsCache = { at: "", paths: new Map() };
-function pathsFromMe() {
+/** Paths from my position, avoiding agents in sight (or not). Cached until I move or sense again. */
+let pathsCache = { at: "", paths: new Map(), ignoringAgents: new Map() };
+function pathsFromMe(ignoreAgents = false) {
   const at = `${me.x}_${me.y}_${sensingCount}`;
-  if (pathsCache.at != at) pathsCache = { at, paths: bfs([me], obstacles()) };
-  return pathsCache.paths;
+  if (pathsCache.at != at) pathsCache = { at, paths: bfs([me], obstacles()), ignoringAgents: bfs([me]) };
+  return ignoreAgents ? pathsCache.ignoringAgents : pathsCache.paths;
 }
 
 /** @type { function ({x:number, y:number}): number } steps from me, Infinity if unreachable */
 const steps = (tile) => pathsFromMe().get(key(tile))?.steps ?? Infinity;
 
-/** Paths from other agents (ignoring obstacles), cached per sensing event */
+/** Paths from other agents (ignoring agents), cached per sensing event */
 let agentPathsCache = { at: -1, paths: new Map() };
 /** @type { function ({id:string, x:number, y:number}, {x:number, y:number}): number } */
 function agentSteps(agent, tile) {
   if (agentPathsCache.at != sensingCount) agentPathsCache = { at: sensingCount, paths: new Map() };
   let paths = agentPathsCache.paths.get(agent.id);
   if (!paths) {
-    paths = bfs([agent], crates);
+    paths = bfs([agent]);
     agentPathsCache.paths.set(agent.id, paths);
   }
   return paths.get(key(tile))?.steps ?? Infinity;
@@ -340,10 +460,16 @@ function agentSteps(agent, tile) {
 /** @type { function ({x:number, y:number}): number } steps from a tile to the nearest delivery */
 const stepsToDelivery = (tile) => toDelivery.get(key(tile))?.steps ?? Infinity;
 
-/** @returns nearest delivery tile reachable from me, with its distance */
+/** @returns nearest delivery tile reachable from me (if needed, once agents in the way move), with its distance */
 function nearestDelivery() {
   let best = { tile: /** @type { {x:number, y:number} | undefined } */ (undefined), steps: Infinity };
-  for (const t of deliveryTiles) if (steps(t) < best.steps) best = { tile: t, steps: steps(t) };
+  for (const paths of [pathsFromMe(), pathsFromMe(true)]) {
+    for (const t of deliveryTiles) {
+      const s = paths.get(key(t))?.steps ?? Infinity;
+      if (s < best.steps) best = { tile: t, steps: s };
+    }
+    if (best.tile) break;
+  }
   return best;
 }
 
@@ -386,17 +512,22 @@ function valid(predicate) {
     const p = parcels.get(id);
     if (!p || p.carriedBy) return false; // gone, or someone took it
     if (carried().length >= game.capacity) return false; // I am full
-    const mine = steps(p);
+    const mine = pathsFromMe(true).get(key(p))?.steps ?? Infinity; // agents in the way move on
     if (mine == Infinity) return false; // unreachable
-    for (const a of agents.values()) if (agentSteps(a, p) < mine) return false; // someone is closer
+    // someone is clearly closer (positions of moving agents are rounded: a 1-step lead is noise)
+    for (const a of agents.values()) if (agentSteps(a, p) + 1 < mine) return false;
     const trip = mine + stepsToDelivery(p);
     return rewardOf(p) - decayPerStep() * trip > 0; // it would not expire before delivery
   }
 
-  if (type == "go_deliver") return carried().length > 0 && nearestDelivery().steps < Infinity;
+  if (type == "go_deliver") {
+    // agents move away: a delivery tile blocked only by agents is still worth heading to
+    return carried().length > 0 && deliveryTiles.some((t) => pathsFromMe(true).has(key(t)));
+  }
 
   if (type == "explore") {
-    if (carried().length) return false;
+    // also when carrying but no delivery tile is reachable (e.g. crates in the way): look around
+    if (carried().length && valid(["go_deliver"])) return false;
     return !freeParcels().some((p) => valid(["go_pick_up", p.x, p.y, p.id]));
   }
 
@@ -667,16 +798,19 @@ class IntentionDeliberation {
 const planLibrary = [];
 
 /**
- * Resolves at the next sensing event
+ * Resolves at the next sensing event, or after maxMs: the server only sends sensing
+ * when something in sight changes, so waiting for it alone may never end.
  * @returns { Promise<void> }
  */
-function nextSensing() {
+function nextSensing(maxMs = 1000) {
   return new Promise((res) => {
-    const listener = () => {
-      socket.off("sensing", listener);
+    const done = () => {
+      clearTimeout(timer);
+      socket.off("sensing", done);
       res();
     };
-    socket.onSensing(listener);
+    const timer = setTimeout(done, maxMs);
+    socket.onSensing(done);
   });
 }
 
@@ -690,14 +824,23 @@ async function move(direction) {
   const start = Date.now();
   const { dx, dy } = /** @type { {dx:number, dy:number} } */ (MOVES.find((m) => m.direction == direction));
   const target = { x: me.x + dx, y: me.y + dy };
+  const pushing = crates.has(key(target));
   try {
     const moved = await socket.emitMove(direction);
     if (moved) {
       me.x = moved.x;
       me.y = moved.y;
       game.stepMs = 0.8 * game.stepMs + 0.2 * (Date.now() - start);
+      if (pushing) {
+        // the crate slid one tile further: update beliefs now (sensing may have done it already)
+        const slid = { x: target.x + dx, y: target.y + dy };
+        crates.delete(key(target));
+        crates.add(key(slid));
+        recomputeToDelivery();
+        console.log("pushed crate", direction, "from", key(target), "to", key(slid));
+      }
     } else {
-      const blockedBy = obstacles().has(key(target)) ? "agent/crate" : "?";
+      const blockedBy = obstacles().has(key(target)) ? "agent" : crates.has(key(target)) ? "crate" : "?";
       console.log("move rejected:", direction, "into", key(target), "tile", tiles.get(key(target)), "blocked by", blockedBy);
     }
     return moved;
@@ -706,6 +849,23 @@ async function move(direction) {
     await nextSensing();
     return false;
   }
+}
+
+/**
+ * When agents block each other on bottlenecks (e.g. head-on in a 1-wide corridor), the one with
+ * the smaller id gives way: it backs out to the nearest tile off the bottlenecks, so the other can pass.
+ * A fixed priority makes sure that exactly one of two such agents moves.
+ */
+async function makeWay() {
+  const near = Array.from(agents.values()).filter((a) => a.seenAt == lastSensingAt); // the ones in sight
+  if (!near.some((a) => a.id > me.id)) return; // I have priority (or nobody is in sight): the others move
+  const from = key(me);
+  for (let i = 0; i < MAKE_WAY_MAX_STEPS && bottlenecks.has(key(me)); i++) {
+    let best = { steps: Infinity, first: /** @type { Direction | undefined } */ (undefined) };
+    for (const [k, p] of pathsFromMe()) if (!bottlenecks.has(k) && !crates.has(k) && p.steps < best.steps) best = p;
+    if (!best.first || !(await move(best.first))) break;
+  }
+  if (key(me) != from) console.log("made way from", from, "to", key(me));
 }
 
 /**
@@ -824,13 +984,17 @@ class Explore extends PlanBase {
   }
 
   /**
-   * Go to the reachable spawner not seen for the longest time (penalised by distance)
+   * Go to the reachable spawner not seen for the longest time (penalised by distance).
+   * If no spawner is reachable (e.g. walled in by crates), look around the rest of the map.
    * @type { function( string, ...any ) : Promise<boolean> }
    */
   async execute(explore) {
     if (this.stopped) throw ["stopped"];
-    const candidates = spawnerTiles.length ? spawnerTiles : Array.from(tiles.keys()).map(fromKey);
-    const reachable = candidates.filter((t) => key(t) != key(me) && steps(t) < Infinity);
+    // reachable once agents in the way move on: wandering around because of them would block them in turn
+    const cost = (/** @type {{x:number, y:number}} */ t) => pathsFromMe(true).get(key(t))?.steps ?? Infinity;
+    const isTarget = (/** @type {{x:number, y:number}} */ t) => key(t) != key(me) && cost(t) < Infinity;
+    let reachable = spawnerTiles.filter(isTarget);
+    if (!reachable.length) reachable = Array.from(tiles.keys()).map(fromKey).filter(isTarget);
     if (!reachable.length) {
       // e.g. standing on the only spawner, or everything blocked: wait instead of spinning
       await nextSensing();
@@ -838,8 +1002,8 @@ class Explore extends PlanBase {
     }
     const now = Date.now();
     const score = (/** @type {{x:number, y:number}} */ t) => {
-      const unseenMs = now - (spawnerSeenAt.get(key(t)) ?? 0);
-      return Math.min(unseenMs, 60000) / (1 + steps(t)) + Math.random(); // random tie-break
+      const unseenMs = now - (tileSeenAt.get(key(t)) ?? 0);
+      return Math.min(unseenMs, 60000) / (1 + cost(t)) + Math.random(); // random tie-break
     };
     const target = reachable.reduce((best, t) => (score(t) > score(best) ? t : best));
     await this.subIntention(["go_to", target.x, target.y]);
@@ -870,12 +1034,13 @@ class PathMove extends PlanBase {
       const first = pathsFromMe().get(key({ x, y }))?.first;
       if (!first) {
         // blocked only by agents (e.g. a narrow corridor)? wait for them to move away
-        const reachableIgnoringAgents = bfs([me], crates).has(key({ x, y }));
+        const reachableIgnoringAgents = pathsFromMe(true).has(key({ x, y }));
         if (reachableIgnoringAgents && ++waits < BLOCKED_WAIT_SENSINGS) {
+          await makeWay(); // face-off in a corridor: one of the two backs out
           await nextSensing();
           continue;
         }
-        throw ["no path to", x, y];
+        throw [reachableIgnoringAgents ? "blocked by agents to" : "no path to", x, y];
       }
 
       if (await move(first)) {
