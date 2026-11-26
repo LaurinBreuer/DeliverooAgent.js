@@ -41,12 +41,30 @@ const MOVES = [
   { direction: "left", dx: -1, dy: 0 },
 ];
 
+/** Numeric tunable, overridable with an environment variable (used by the benchmark to sweep values) */
+const tunable = (/** @type {string} */ name, /** @type {number} */ fallback) => {
+  const v = Number(process.env[name]);
+  return process.env[name] !== undefined && process.env[name] !== "" && Number.isFinite(v) ? v : fallback;
+};
+
 /** Switch intention only if the new one is better by at least this many points */
-const SWITCH_MARGIN = 10;
-/** Remembered agents are forgotten after this many ms */
-const AGENT_MEMORY_MS = 2000;
+const SWITCH_MARGIN = tunable("SWITCH_MARGIN", 10);
+/** Remembered agents are forgotten after this many ms (halved when the area is crowded) */
+const AGENT_MEMORY_MS = tunable("AGENT_MEMORY_MS", 2000);
 /** Sensing events to wait when the only path is blocked by other agents */
-const BLOCKED_WAIT_SENSINGS = 10;
+const BLOCKED_WAIT_SENSINGS = tunable("BLOCKED_WAIT_SENSINGS", 6);
+/** A target that blocked me is avoided for this many ms (anti-deadlock cooldown) */
+const COOLDOWN_MS = tunable("COOLDOWN_MS", 5000);
+/** Pause after a failed intention, so a hopeless one cannot spin the loop */
+const FAIL_PAUSE_MS = tunable("FAIL_PAUSE_MS", 250);
+/** Chance of winning a parcel when a rival is at least as close as me (reward is scaled by this) */
+const RIVAL_WIN_SHARE = tunable("RIVAL_WIN_SHARE", 0.4);
+/** Fraction of the reward of nearby parcels counted as bonus when choosing a parcel (multi-pickup) */
+const CLUSTER_BONUS = tunable("CLUSTER_BONUS", 0.3);
+/** Radius (manhattan) within which parcels count as a cluster */
+const CLUSTER_RADIUS = tunable("CLUSTER_RADIUS", 3);
+/** Weight of the recent-spawn heat of a spawner tile when choosing where to explore */
+const HEAT_WEIGHT = tunable("HEAT_WEIGHT", 0.5);
 /** Max steps backed out of a bottleneck to let another agent pass */
 const MAKE_WAY_MAX_STEPS = 8;
 /** Extra cost of pushing a crate: free paths are preferred, crates are moved only when it pays off */
@@ -349,6 +367,21 @@ const crates = new Set();
 /** @type { Map<string, number> } last time each tile was in sight */
 const tileSeenAt = new Map();
 
+/** @type { Map<string, number> } tile -> time until which it is avoided (it blocked me recently) */
+const cooldownUntil = new Map();
+/** Avoid a tile as a target for a while */
+const coolDown = (/** @type {string} */ k) => cooldownUntil.set(k, Date.now() + COOLDOWN_MS);
+/** Is a tile still cooling down? */
+const isCoolingDown = (/** @type {string} */ k) => (cooldownUntil.get(k) ?? 0) > Date.now();
+
+/** @type { Map<string, {n:number, at:number}> } tile -> number of parcels first seen there (decaying "heat") */
+const spawnHeat = new Map();
+/** Spawn heat of a tile: every sighting counts, halved every minute */
+function heatOf(/** @type {string} */ k) {
+  const h = spawnHeat.get(k);
+  return h ? h.n * Math.pow(0.5, (Date.now() - h.at) / 60000) : 0;
+}
+
 /** Incremented at every sensing event, used to cache path computations */
 let sensingCount = 0;
 let lastSensingAt = 0;
@@ -375,6 +408,11 @@ socket.onSensing((sensing) => {
   const sensedParcels = new Set();
   for (const p of sensing.parcels) {
     sensedParcels.add(p.id);
+    if (!parcels.has(p.id) && !p.carriedBy) {
+      // a new parcel: remember where parcels show up, to explore the hot spawners first
+      const k = key(p);
+      spawnHeat.set(k, { n: heatOf(k) + 1, at: now });
+    }
     parcels.set(p.id, { ...p, seenAt: now });
   }
   for (const [id, p] of parcels) {
@@ -389,9 +427,11 @@ socket.onSensing((sensing) => {
     if (a.id == me.id || a.x === undefined || a.y === undefined) continue;
     agents.set(a.id, { id: a.id, x: a.x, y: a.y, seenAt: now });
   }
+  // crowded area: positions go stale faster, so forget them sooner
+  const memoryMs = sensing.agents.length >= 3 ? AGENT_MEMORY_MS / 2 : AGENT_MEMORY_MS;
   for (const [id, a] of agents) {
     if (a.seenAt == now) continue;
-    if (now - a.seenAt > AGENT_MEMORY_MS || inSight(a)) agents.delete(id);
+    if (now - a.seenAt > memoryMs || inSight(a)) agents.delete(id);
   }
 
   // remembered free parcels whose tile was visited by another agent are probably gone
@@ -463,10 +503,15 @@ const stepsToDelivery = (tile) => toDelivery.get(key(tile))?.steps ?? Infinity;
 /** @returns nearest delivery tile reachable from me (if needed, once agents in the way move), with its distance */
 function nearestDelivery() {
   let best = { tile: /** @type { {x:number, y:number} | undefined } */ (undefined), steps: Infinity };
-  for (const paths of [pathsFromMe(), pathsFromMe(true)]) {
-    for (const t of deliveryTiles) {
-      const s = paths.get(key(t))?.steps ?? Infinity;
-      if (s < best.steps) best = { tile: t, steps: s };
+  // delivery tiles that blocked me recently are tried last (another one may be free)
+  const candidates = deliveryTiles.filter((t) => !isCoolingDown(key(t)));
+  for (const tiles of candidates.length ? [candidates, deliveryTiles] : [deliveryTiles]) {
+    for (const paths of [pathsFromMe(), pathsFromMe(true)]) {
+      for (const t of tiles) {
+        const s = paths.get(key(t))?.steps ?? Infinity;
+        if (s < best.steps) best = { tile: t, steps: s };
+      }
+      if (best.tile) break;
     }
     if (best.tile) break;
   }
@@ -486,8 +531,22 @@ function utility(predicate) {
   if (type == "go_pick_up") {
     const p = parcels.get(id);
     if (!p) return -Infinity;
-    const trip = steps({ x, y }) + stepsToDelivery({ x, y });
-    return bagReward + rewardOf(p) - (bag.length + 1) * decayPerStep() * trip;
+    const mine = steps({ x, y });
+    const trip = mine + stepsToDelivery({ x, y });
+
+    // a rival at least as close as me may well take it: only count a share of its reward
+    let share = 1;
+    for (const a of agents.values()) if (agentSteps(a, p) <= mine) share = Math.min(share, RIVAL_WIN_SHARE);
+
+    // multi-pickup: parcels near this one are likely collected in the same trip
+    let cluster = 0;
+    if (bag.length + 1 < game.capacity) {
+      for (const q of freeParcels()) {
+        if (q.id != p.id && distance(p, q) <= CLUSTER_RADIUS && !isCoolingDown(key(q))) cluster += rewardOf(q);
+      }
+    }
+
+    return bagReward + share * rewardOf(p) + CLUSTER_BONUS * cluster - (bag.length + 1) * decayPerStep() * trip;
   }
 
   if (type == "go_deliver") {
@@ -512,6 +571,7 @@ function valid(predicate) {
     const p = parcels.get(id);
     if (!p || p.carriedBy) return false; // gone, or someone took it
     if (carried().length >= game.capacity) return false; // I am full
+    if (isCoolingDown(key(p))) return false; // it blocked me a moment ago: try elsewhere first
     const mine = pathsFromMe(true).get(key(p))?.steps ?? Infinity; // agents in the way move on
     if (mine == Infinity) return false; // unreachable
     // someone is clearly closer (positions of moving agents are rounded: a 1-step lead is noise)
@@ -586,6 +646,7 @@ class IntentionRevision {
         const intention = this.intention_queue[0];
 
         // Is queued intention still valid? Do I still want to achieve it?
+        let failed = false;
         if (!valid(intention.predicate)) {
           console.log("Skipping intention because no more valid", ...intention.predicate);
         } else {
@@ -594,11 +655,16 @@ class IntentionRevision {
           await intention
             .achieve()
             // Catch eventual error and continue
-            .catch((error) => {});
+            .catch(() => {
+              // stopped on purpose by revision: not a failure. Otherwise (blocked, no path): breathe a bit
+              failed = !intention.stopped;
+            });
         }
 
         // Remove from the queue (also when skipped, otherwise the loop spins forever on it)
         this.intention_queue.shift();
+        // a failed intention is not retried in a tight loop
+        if (failed) await new Promise((res) => setTimeout(res, FAIL_PAUSE_MS));
       }
       // Postpone next iteration at setImmediate
       await new Promise((res) => setImmediate(res));
@@ -993,7 +1059,9 @@ class Explore extends PlanBase {
     // reachable once agents in the way move on: wandering around because of them would block them in turn
     const cost = (/** @type {{x:number, y:number}} */ t) => pathsFromMe(true).get(key(t))?.steps ?? Infinity;
     const isTarget = (/** @type {{x:number, y:number}} */ t) => key(t) != key(me) && cost(t) < Infinity;
-    let reachable = spawnerTiles.filter(isTarget);
+    const isFresh = (/** @type {{x:number, y:number}} */ t) => isTarget(t) && !isCoolingDown(key(t));
+    let reachable = spawnerTiles.filter(isFresh);
+    if (!reachable.length) reachable = spawnerTiles.filter(isTarget);
     if (!reachable.length) reachable = Array.from(tiles.keys()).map(fromKey).filter(isTarget);
     if (!reachable.length) {
       // e.g. standing on the only spawner, or everything blocked: wait instead of spinning
@@ -1003,7 +1071,8 @@ class Explore extends PlanBase {
     const now = Date.now();
     const score = (/** @type {{x:number, y:number}} */ t) => {
       const unseenMs = now - (tileSeenAt.get(key(t)) ?? 0);
-      return Math.min(unseenMs, 60000) / (1 + cost(t)) + Math.random(); // random tie-break
+      // unseen for long, close, and where parcels recently showed up
+      return (Math.min(unseenMs, 60000) * (1 + HEAT_WEIGHT * heatOf(key(t)))) / (1 + cost(t)) + Math.random(); // random tie-break
     };
     const target = reachable.reduce((best, t) => (score(t) > score(best) ? t : best));
     await this.subIntention(["go_to", target.x, target.y]);
@@ -1040,13 +1109,18 @@ class PathMove extends PlanBase {
           await nextSensing();
           continue;
         }
+        // anti-deadlock: avoid this target for a while, so the next intention picks another one
+        if (reachableIgnoringAgents) coolDown(key({ x, y }));
         throw [reachableIgnoringAgents ? "blocked by agents to" : "no path to", x, y];
       }
 
       if (await move(first)) {
         failures = 0;
         await opportunisticActions();
-      } else if (++failures >= 3) throw ["stucked"];
+      } else if (++failures >= 3) {
+        coolDown(key({ x, y }));
+        throw ["stucked"];
+      }
       else await nextSensing(); // blocked: wait for fresh beliefs and re-plan
     }
     return true;
